@@ -8,107 +8,75 @@ This diagram details the OAuth bearer token acquisition and caching mechanism us
 
 ```mermaid
 sequenceDiagram
-    participant BL as Business Logic<br/>(BiometricsBL)
-    participant Bearer as Bearer Token<br/>Service
-    participant Cache as Token Cache<br/>(In-Memory)
-    participant ACE_Auth as ACE OAuth<br/>Token Endpoint
-    participant AppIns as Application<br/>Insights
+    participant BL as BiometricsBL (Business Logic)
+    participant Bearer as Bearer Token Service
+    participant Cache as In-Memory Token Cache
+    participant ACE as ACE OAuth Token Endpoint
+    participant AI as Application Insights
 
     BL->>+Bearer: GetBearerToken()
-    Bearer->>AppIns: Log Token Request
-    
-    Bearer->>+Cache: Check Cached Token<br/>Key: "ACE_SERVICE_TOKEN"
-    
-    alt Token Found in Cache
-        Cache-->>Bearer: Cached Token Object<br/>{AccessToken, ExpiresAt}
-        
-        Bearer->>Bearer: Check Token Expiration<br/>Is ExpiresAt > DateTime.UtcNow + 5 minutes?
-        
-        alt Token Still Valid (Not Expired)
-            Bearer->>AppIns: Log "Using Cached Token"<br/>{ExpiresIn: (ExpiresAt - Now)}
-            Cache-->>-Bearer: Valid Token
-            Bearer-->>-BL: Return AccessToken
-            Note over BL,Bearer: Cache Hit - Fast Path
-        else Token Expired or Expiring Soon
-            Bearer->>AppIns: Log "Token Expired or Expiring"
-            Note over Bearer: Proceed to Refresh Token
+    Bearer->>AI: Log: TokenRequested
+
+    Bearer->>+Cache: TryGet("ACE_SERVICE_TOKEN")
+
+    alt Cache hit
+        Cache-->>Bearer: CachedToken { token, expiresAt }
+        Bearer->>Bearer: expiresAt > (UtcNow + 5m)?
+
+        alt Token valid
+            Bearer->>AI: Log: TokenCacheHit (ttl remaining)
+            Bearer-->>-BL: access_token
+        else Expiring/expired
+            Bearer->>AI: Log: TokenCacheStale
         end
-    else Token Not in Cache
-        Bearer->>AppIns: Log "No Cached Token Found"
-        Cache-->>-Bearer: null
-        Note over Bearer: Proceed to Acquire New Token
+
+    else Cache miss
+        Cache-->>Bearer: null
+        Bearer->>AI: Log: TokenCacheMiss
     end
-    
-    Note over Bearer,ACE_Auth: === Token Acquisition Flow ===
-    
-    Bearer->>Bearer: Load OAuth Configuration<br/>- ClientId from config<br/>- ClientSecret from config<br/>- TokenURL from config
-    
-    Bearer->>Bearer: Build Token Request<br/>grant_type: "client_credentials"<br/>client_id: {ClientId}<br/>client_secret: {ClientSecret}<br/>scope: "biometric.read biometric.write"
-    
-    Bearer->>AppIns: Log "Requesting New Token"<br/>{ClientId, Endpoint}
-    
-    Bearer->>+ACE_Auth: POST /oauth/token<br/>Content-Type: application/x-www-form-urlencoded<br/>Body: grant_type=client_credentials&<br/>      client_id={ClientId}&<br/>      client_secret={ClientSecret}&<br/>      scope=biometric.read+biometric.write
-    
-    alt OAuth Server Success
-        ACE_Auth->>ACE_Auth: Validate Client Credentials
-        ACE_Auth->>ACE_Auth: Generate Access Token
-        
-        ACE_Auth-->>-Bearer: 200 OK<br/>{<br/>  "access_token": "eyJhbGci...",<br/>  "token_type": "Bearer",<br/>  "expires_in": 3600,<br/>  "scope": "biometric.read biometric.write"<br/>}
-        
-        Bearer->>Bearer: Parse Token Response<br/>Extract AccessToken<br/>Calculate ExpiresAt = Now + ExpiresIn
-        
-        Bearer->>+Cache: Store Token in Cache<br/>Key: "ACE_SERVICE_TOKEN"<br/>Value: {AccessToken, ExpiresAt}<br/>Expiration: 1 hour
-        Cache-->>-Bearer: Token Cached
-        
-        Bearer->>AppIns: Log "Token Acquired Successfully"<br/>{ExpiresIn: 3600, CachedUntil}
-        
-        Bearer-->>BL: Return AccessToken
-        
-    else OAuth Server Error - Invalid Credentials
-        ACE_Auth-->>Bearer: 401 Unauthorized<br/>{<br/>  "error": "invalid_client",<br/>  "error_description": "Invalid client credentials"<br/>}
-        
-        Bearer->>AppIns: Log Error "Invalid OAuth Credentials"<br/>{Error, Description}
-        
-        Bearer->>Bearer: Throw AuthenticationException<br/>("Failed to acquire bearer token: Invalid credentials")
-        
-        Bearer-->>BL: Exception: AuthenticationException
-        
-    else OAuth Server Error - Invalid Grant Type
-        ACE_Auth-->>Bearer: 400 Bad Request<br/>{<br/>  "error": "unsupported_grant_type",<br/>  "error_description": "Grant type not supported"<br/>}
-        
-        Bearer->>AppIns: Log Error "Invalid Grant Type"
-        
-        Bearer->>Bearer: Throw AuthenticationException<br/>("Failed to acquire bearer token: Invalid grant type")
-        
-        Bearer-->>BL: Exception: AuthenticationException
-        
-    else OAuth Server Error - Server Error
-        ACE_Auth-->>Bearer: 500 Internal Server Error<br/>{<br/>  "error": "server_error",<br/>  "error_description": "Temporary server error"<br/>}
-        
-        Bearer->>AppIns: Log Error "OAuth Server Error"<br/>{StatusCode: 500}
-        
-        Bearer->>Bearer: Retry Once After 1 Second
-        
-        alt Retry Successful
-            Bearer->>ACE_Auth: POST /oauth/token (Retry)
-            ACE_Auth-->>Bearer: 200 OK + Token
-            Bearer->>Cache: Store Token
-            Bearer->>AppIns: Log "Token Acquired on Retry"
-            Bearer-->>BL: Return AccessToken
-        else Retry Failed
-            Bearer->>AppIns: Log Error "OAuth Retry Failed"
-            Bearer->>Bearer: Throw AuthenticationException<br/>("Failed to acquire bearer token after retry")
-            Bearer-->>BL: Exception: AuthenticationException
+
+    Note over Bearer,ACE: Token acquisition (OAuth2 client_credentials)\nConfig: ClientId, ClientSecret (Key Vault), TokenUrl, Scope\nPOST x-www-form-urlencoded: grant_type=client_credentials; scope=biometric.read biometric.write
+
+    Bearer->>AI: Log: TokenAcquireStart
+    Bearer->>+ACE: POST /oauth/token
+
+    alt 200 OK
+        ACE-->>-Bearer: TokenResponse (access_token, expires_in)
+        Bearer->>Bearer: expiresAt = UtcNow + expires_in
+        Bearer->>+Cache: Set("ACE_SERVICE_TOKEN", token, ttl=1h)
+        Cache-->>-Bearer: cached
+        Bearer->>AI: Log: TokenAcquired
+        Bearer-->>BL: access_token
+
+    else 401 invalid_client
+        ACE-->>Bearer: 401 Unauthorized
+        Bearer->>AI: Log: TokenAcquireFailed (invalid_client)
+        Bearer-->>BL: throw AuthenticationException
+
+    else 400 unsupported_grant_type
+        ACE-->>Bearer: 400 Bad Request
+        Bearer->>AI: Log: TokenAcquireFailed (unsupported_grant_type)
+        Bearer-->>BL: throw AuthenticationException
+
+    else 5xx server error
+        ACE-->>Bearer: 5xx
+        Bearer->>AI: Log: TokenAcquireFailed (server_error)
+        Bearer->>Bearer: Retry once after 1s
+
+        alt Retry succeeds
+            Bearer->>ACE: POST /oauth/token (retry)
+            ACE-->>Bearer: 200 OK (token)
+            Bearer->>Cache: Set("ACE_SERVICE_TOKEN", token, ttl=1h)
+            Bearer->>AI: Log: TokenAcquired (retry)
+            Bearer-->>BL: access_token
+        else Retry fails
+            Bearer->>AI: Log: TokenAcquireFailed (retry_failed)
+            Bearer-->>BL: throw AuthenticationException
         end
-        
-    else Network Error / Timeout
-        Note over ACE_Auth: Network Timeout or Connection Error
-        
-        Bearer->>AppIns: Log Error "Network Error"<br/>{Exception: HttpRequestException}
-        
-        Bearer->>Bearer: Throw AuthenticationException<br/>("Failed to acquire bearer token: Network error")
-        
-        Bearer-->>BL: Exception: AuthenticationException
+
+    else Network timeout / connection error
+        Bearer->>AI: Log: TokenAcquireFailed (network_error)
+        Bearer-->>BL: throw AuthenticationException
     end
 ```
 
